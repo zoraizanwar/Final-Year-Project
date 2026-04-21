@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta
+from math import ceil
 from django.utils import timezone
 from django.db import connection, reset_queries
+from django.db.models import Count, Avg, Sum
 import openai
 from django.conf import settings
 from accounts.api_config_utils import get_active_api_key
-from .models import InsightCache
+from .models import InsightCache, CustomerReview
 
 try:
     from sales.models import Sale
@@ -489,3 +491,305 @@ def build_daily_ai_recommendation(insights_payload, pricing_suggestions, demand_
     # Fallback to live recommendation if no category-specific signal exists.
     base = build_live_recommendation(insights_payload, pricing_suggestions, demand_alerts, stock_warnings)
     return f"Daily AI Recommendation ({today}): {base}"
+
+
+def analyze_review_sentiment(review_text, rating):
+    """Infer sentiment from review text and star rating."""
+    positive_words = {
+        'good', 'great', 'excellent', 'amazing', 'fast', 'helpful', 'best',
+        'love', 'satisfied', 'awesome', 'perfect', 'quality', 'recommended',
+    }
+    negative_words = {
+        'bad', 'poor', 'late', 'slow', 'worse', 'worst', 'broken', 'issue',
+        'problem', 'refund', 'disappointed', 'low', 'delay', 'damaged',
+    }
+
+    words = str(review_text or '').lower().split()
+    positive_hits = sum(1 for word in words if word.strip('.,!?') in positive_words)
+    negative_hits = sum(1 for word in words if word.strip('.,!?') in negative_words)
+
+    # Blend lexical signal with rating so scores remain useful for short reviews.
+    lexical_score = positive_hits - negative_hits
+    rating_score = float(rating or 3) - 3.0
+    score = round((lexical_score * 0.3) + (rating_score * 0.7), 2)
+
+    if score > 0.4:
+        return 'positive', score
+    if score < -0.4:
+        return 'negative', score
+    return 'neutral', score
+
+
+def get_customer_reviews_snapshot(days=30):
+    """Return live customer review analytics for NLP reporting."""
+    since = timezone.now() - timedelta(days=days)
+    reviews_qs = CustomerReview.objects.filter(created_at__gte=since)
+
+    counts = reviews_qs.values('sentiment_label').annotate(total=Count('id'))
+    sentiment_counts = {'positive': 0, 'neutral': 0, 'negative': 0}
+    for row in counts:
+        sentiment = row.get('sentiment_label')
+        if sentiment in sentiment_counts:
+            sentiment_counts[sentiment] = row.get('total', 0)
+
+    total_reviews = reviews_qs.count()
+    avg_rating = reviews_qs.aggregate(value=Avg('rating')).get('value') or 0.0
+
+    return {
+        'total_reviews': total_reviews,
+        'average_rating': round(float(avg_rating), 2),
+        'positive_reviews': sentiment_counts['positive'],
+        'neutral_reviews': sentiment_counts['neutral'],
+        'negative_reviews': sentiment_counts['negative'],
+        'positive_ratio': round(
+            (sentiment_counts['positive'] / total_reviews) * 100 if total_reviews else 0.0,
+            1,
+        ),
+        'negative_ratio': round(
+            (sentiment_counts['negative'] / total_reviews) * 100 if total_reviews else 0.0,
+            1,
+        ),
+    }
+
+
+def build_live_nlp_report(period_days=30):
+    """Build NLP report payload from live sales and review data."""
+    payload = get_insights_payload()
+    review_summary = get_customer_reviews_snapshot(days=period_days)
+    recent_reviews = list(CustomerReview.objects.all()[:10])
+
+    key_findings = []
+    total_sales = payload.get('total_sales', 0)
+    total_revenue = round(payload.get('total_revenue', 0.0), 2)
+    avg_order_value = round(payload.get('average_order_value', 0.0), 2)
+
+    key_findings.append(
+        f"Live sales snapshot: {total_sales} sale(s), revenue Rs {total_revenue}, average order value Rs {avg_order_value}."
+    )
+
+    if review_summary['total_reviews']:
+        key_findings.append(
+            f"Customer voice: {review_summary['total_reviews']} review(s), average rating {review_summary['average_rating']}/5, "
+            f"positive sentiment {review_summary['positive_ratio']}%."
+        )
+    else:
+        key_findings.append('No customer reviews submitted yet. Collect feedback after each sale.')
+
+    if review_summary['negative_reviews'] > review_summary['positive_reviews']:
+        recommendation = (
+            'Negative feedback is leading. Prioritize service recovery calls and offer targeted discount vouchers to dissatisfied customers.'
+        )
+    elif payload.get('restocking_needed'):
+        top_restock = payload['restocking_needed'][0]['product_name']
+        recommendation = (
+            f"Demand exists but stock is constrained. Restock {top_restock} immediately to protect customer experience."
+        )
+    else:
+        recommendation = (
+            'Customer sentiment is stable. Continue weekly follow-ups and upsell top-selling products to highly satisfied customers.'
+        )
+
+    return {
+        'generated_at': timezone.localtime(),
+        'period_days': int(period_days),
+        'sales_summary': {
+            'total_sales': total_sales,
+            'total_revenue': total_revenue,
+            'average_order_value': avg_order_value,
+            'hot_products': payload.get('hot_products', [])[:5],
+            'restocking_needed': payload.get('restocking_needed', [])[:5],
+        },
+        'review_summary': review_summary,
+        'key_findings': key_findings,
+        'recommendation': recommendation,
+        'recent_reviews': recent_reviews,
+    }
+
+
+def get_smart_reorder_recommendations(period_days=30, lead_time_days=7, coverage_days=14):
+    """Build smart reorder recommendations from live sales and inventory data."""
+    if not Product:
+        return {
+            'generated_at': timezone.localtime(),
+            'period_days': int(period_days),
+            'lead_time_days': int(lead_time_days),
+            'coverage_days': int(coverage_days),
+            'total_products_evaluated': 0,
+            'total_products_to_reorder': 0,
+            'total_discontinue_candidates': 0,
+            'recommendations': [],
+            'discontinue_candidates': [],
+            'product_planning': [],
+        }
+
+    period_days = max(1, min(int(period_days), 365))
+    lead_time_days = max(1, min(int(lead_time_days), 90))
+    coverage_days = max(1, min(int(coverage_days), 180))
+
+    reset_queries()
+    now = timezone.now()
+    since = now - timedelta(days=period_days)
+    recent_window_days = min(7, period_days)
+    recent_since = now - timedelta(days=recent_window_days)
+
+    sales_units = {}
+    sales_counts = {}
+    if Sale:
+        aggregate_30d = Sale.objects.filter(sale_date__gte=since).values('product').annotate(
+            total_units=Sum('quantity_sold'),
+            sales_count=Count('id'),
+        )
+        for row in aggregate_30d:
+            product_id = row.get('product')
+            sales_units[product_id] = int(row.get('total_units') or 0)
+            sales_counts[product_id] = int(row.get('sales_count') or 0)
+
+        aggregate_recent = Sale.objects.filter(sale_date__gte=recent_since).values('product').annotate(
+            total_units=Sum('quantity_sold'),
+        )
+        recent_units = {row.get('product'): int(row.get('total_units') or 0) for row in aggregate_recent}
+    else:
+        recent_units = {}
+
+    recommendations = []
+    discontinue_candidates = []
+    product_planning = []
+    products = list(Product.objects.all())
+
+    for product in products:
+        product_id = product.id
+        current_stock = int(getattr(product, 'stock_quantity', 0) or 0)
+        reorder_level = int(getattr(product, 'reorder_level', 0) or 0)
+        unit_price = float(getattr(product, 'unit_price', 0) or 0)
+
+        units_sold_period = int(sales_units.get(product_id, 0))
+        sales_count_period = int(sales_counts.get(product_id, 0))
+        units_sold_recent = int(recent_units.get(product_id, 0))
+
+        avg_daily_demand = units_sold_period / float(period_days)
+        recent_daily_demand = units_sold_recent / float(recent_window_days)
+        weighted_daily_demand = max(0.0, (avg_daily_demand * 0.6) + (recent_daily_demand * 0.4))
+
+        safety_stock = max(reorder_level, int(ceil(weighted_daily_demand * 3)))
+        target_stock = int(ceil(weighted_daily_demand * (lead_time_days + coverage_days))) + safety_stock
+
+        if weighted_daily_demand == 0:
+            target_stock = max(target_stock, reorder_level)
+
+        reorder_quantity = max(0, target_stock - current_stock)
+        days_to_stockout = (current_stock / weighted_daily_demand) if weighted_daily_demand > 0 else None
+
+        if weighted_daily_demand >= 2:
+            demand_band = 'HIGH'
+        elif weighted_daily_demand >= 0.75:
+            demand_band = 'MEDIUM'
+        elif weighted_daily_demand >= 0.15:
+            demand_band = 'LOW'
+        else:
+            demand_band = 'NO_DEMAND'
+
+        discontinue_recommendation = 'KEEP'
+        discontinue_reason = 'Demand profile is healthy for current stock position.'
+
+        overstock_multiple = (current_stock / max(reorder_level, 1)) if reorder_level > 0 else float(current_stock)
+        stale_inventory = units_sold_period == 0 and current_stock > max(reorder_level * 2, 10)
+        very_low_movement = units_sold_period <= 1 and current_stock > max(reorder_level * 2, 15)
+        weak_demand_overstock = weighted_daily_demand < 0.15 and overstock_multiple >= 3
+
+        if stale_inventory:
+            discontinue_recommendation = 'DISCONTINUE'
+            discontinue_reason = 'No unit sold in selected period while inventory remains high.'
+        elif weak_demand_overstock or very_low_movement:
+            discontinue_recommendation = 'PHASE_DOWN'
+            discontinue_reason = 'Very low demand relative to inventory. Stop fresh purchasing and clear stock first.'
+
+        urgency = 'NONE'
+        urgency_weight = 0
+
+        if reorder_quantity > 0:
+            if current_stock <= 0 or (days_to_stockout is not None and days_to_stockout <= lead_time_days):
+                urgency = 'CRITICAL'
+                urgency_weight = 3
+            elif current_stock <= reorder_level or (days_to_stockout is not None and days_to_stockout <= (lead_time_days + 3)):
+                urgency = 'WARNING'
+                urgency_weight = 2
+            else:
+                urgency = 'PLANNED'
+                urgency_weight = 1
+
+        priority_score = round((reorder_quantity * 0.5) + (weighted_daily_demand * 8) + (urgency_weight * 25), 2)
+        estimated_cost = round(reorder_quantity * unit_price, 2)
+
+        row = {
+            'product_id': product_id,
+            'product_name': product.name,
+            'sku': product.sku,
+            'current_stock': current_stock,
+            'reorder_level': reorder_level,
+            'units_sold_period': units_sold_period,
+            'sales_count_period': sales_count_period,
+            'avg_daily_demand': round(avg_daily_demand, 2),
+            'weighted_daily_demand': round(weighted_daily_demand, 2),
+            'demand_band': demand_band,
+            'lead_time_days': lead_time_days,
+            'coverage_days': coverage_days,
+            'target_stock': target_stock,
+            'recommended_order_quantity': reorder_quantity,
+            'days_to_stockout': round(days_to_stockout, 1) if days_to_stockout is not None else None,
+            'urgency': urgency,
+            'priority_score': priority_score,
+            'estimated_order_cost': estimated_cost,
+            'discontinue_recommendation': discontinue_recommendation,
+            'discontinue_reason': discontinue_reason,
+        }
+
+        product_planning.append(row)
+
+        if reorder_quantity > 0:
+            recommendations.append(row)
+
+        if discontinue_recommendation in {'DISCONTINUE', 'PHASE_DOWN'}:
+            discontinue_candidates.append(row)
+
+    recommendations = sorted(
+        recommendations,
+        key=lambda row: (
+            row['urgency'] == 'CRITICAL',
+            row['urgency'] == 'WARNING',
+            row['priority_score'],
+        ),
+        reverse=True,
+    )
+
+    discontinue_candidates = sorted(
+        discontinue_candidates,
+        key=lambda row: (
+            row['discontinue_recommendation'] == 'DISCONTINUE',
+            row['demand_band'] == 'NO_DEMAND',
+            row['current_stock'],
+        ),
+        reverse=True,
+    )
+
+    product_planning = sorted(
+        product_planning,
+        key=lambda row: (
+            row['recommended_order_quantity'] > 0,
+            row['urgency'] == 'CRITICAL',
+            row['priority_score'],
+        ),
+        reverse=True,
+    )
+
+    return {
+        'generated_at': timezone.localtime(),
+        'period_days': period_days,
+        'lead_time_days': lead_time_days,
+        'coverage_days': coverage_days,
+        'total_products_evaluated': len(products),
+        'total_products_to_reorder': len(recommendations),
+        'total_discontinue_candidates': len(discontinue_candidates),
+        'recommendations': recommendations[:25],
+        'discontinue_candidates': discontinue_candidates[:25],
+        'product_planning': product_planning,
+    }

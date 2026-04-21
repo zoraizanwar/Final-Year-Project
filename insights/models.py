@@ -39,3 +39,39 @@ class InsightRecommendation(models.Model):
 
     def __str__(self):
         return f"Recommendation #{self.id}"
+
+
+class CustomerReview(models.Model):
+    """Live customer reviews used in NLP reporting."""
+
+    SENTIMENT_CHOICES = [
+        ('positive', 'Positive'),
+        ('neutral', 'Neutral'),
+        ('negative', 'Negative'),
+    ]
+
+    sale = models.ForeignKey(
+        'sales.Sale',
+        on_delete=models.SET_NULL,
+        related_name='customer_reviews',
+        null=True,
+        blank=True,
+    )
+    customer_name = models.CharField(max_length=255)
+    review_text = models.TextField()
+    rating = models.PositiveSmallIntegerField()
+    sentiment_label = models.CharField(max_length=20, choices=SENTIMENT_CHOICES, default='neutral')
+    sentiment_score = models.FloatField(default=0.0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['-created_at']),
+            models.Index(fields=['sentiment_label']),
+            models.Index(fields=['rating']),
+        ]
+
+    def __str__(self):
+        return f"Review #{self.id} - {self.customer_name} ({self.rating}/5)"
